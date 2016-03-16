@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,30 +13,31 @@ import (
 	"time"
 )
 
-var pid string
+var processName string
 var length int64
 var file string
 var interval int
+var now = time.Now()
+var layout = "20060102150405"
+var cpuFileName = fmt.Sprintf("cpu_%s", now.Format(layout))
+var memFileName = fmt.Sprintf("mem_%s", now.Format(layout))
+var whiteSpace = regexp.MustCompile(` +`)
 
 func main() {
-	flag.StringVar(&pid, "pid", "", "pid to monitor")
+	flag.StringVar(&processName, "name", "", "processName to monitor")
 	flag.Int64Var(&length, "time", 0, "how many seconds the monitor should run for")
 	flag.StringVar(&file, "file", "data", "file to write data to")
 	flag.IntVar(&interval, "interval", 2, "interval in seconds")
 	flag.Parse()
 
-	if pid == "" {
-		fmt.Println("please specify a pid")
+	if processName == "" {
+		fmt.Println("please specify a process name")
 		os.Exit(0)
 	}
 
 	results := make(map[string]map[string][]string)
 
-	results[pid] = make(map[string][]string)
-	results[pid]["cpu"] = make([]string, 0)
-	results[pid]["mem"] = make([]string, 0)
-
-	out, err := exec.Command("pgrep", "-P", pid).Output()
+	out, err := exec.Command("pgrep", processName).Output()
 	if strings.Trim(string(out), " ") != "" {
 		childProcessesList := strings.Split(string(out), "\n")
 
@@ -52,7 +54,7 @@ func main() {
 	t := time.NewTicker(time.Duration(interval) * time.Second)
 
 	stopper := time.NewTimer(time.Duration(length) * time.Second)
-
+	length := 0
 	for {
 		select {
 		case <-t.C:
@@ -61,15 +63,14 @@ func main() {
 				wg.Add(1)
 				go func(pid string) {
 					out, err = exec.Command("ps", "-p", pid, "-o", "%mem,%cpu").Output()
-
 					if err != nil {
 						fmt.Printf("oh no error: %s output: %s\n", err.Error(), string(out))
+						writeResults(results, length)
 						os.Exit(1)
 					}
 
 					s := strings.Split(string(out), "\n")
-
-					v := strings.Split(strings.Replace(strings.Trim(s[1], " "), "  ", " ", -1), " ")
+					v := whiteSpace.Split(strings.Trim(s[1], " "), -1)
 					mem := v[0]
 					cpu := v[1]
 					results[pid]["mem"] = append(results[pid]["mem"], mem)
@@ -79,53 +80,69 @@ func main() {
 
 			}
 			wg.Wait()
+			length++
 		case <-stopper.C:
-			writeResults(results, file)
+			writeResults(results, length)
 			os.Exit(0)
 		}
 	}
 
-	writeResults(results, file)
-
+	writeResults(results, length)
 }
 
-func writeResults(results map[string]map[string][]string, file string) {
-	f, err := os.Create(file)
-
+func writeResults(results map[string]map[string][]string, length int) {
+	cpuFile, err := os.Create(cpuFileName)
 	if err != nil {
-		fmt.Printf("could not open file %s for writing\n", file)
+		fmt.Printf("could not open file %s for writing\n", cpuFile)
 		os.Exit(1)
 	}
+	memFile, err := os.Create(memFileName)
+
+	if err != nil {
+		fmt.Printf("could not open file %s for writing\n", memFile)
+		os.Exit(1)
+	}
+
 	keys := []string{}
 	for k, _ := range results {
 		keys = append(keys, k)
 	}
-	row := make([]string, 0)
+	memRow := make([]string, 0)
+	cpuRow := make([]string, 0)
 	for _, k := range keys {
-		row = append(row, k)
+		memRow = append(memRow, k)
+		cpuRow = append(cpuRow, k)
 	}
 
-	for i := 0; i < len(results[pid]["mem"]); i++ {
+	for i := 0; i < length; i++ {
 
-		row = []string{strconv.Itoa(i + 1)}
+		memRow = []string{strconv.Itoa(i + 1)}
+		cpuRow = []string{strconv.Itoa(i + 1)}
 
 		for _, k := range keys {
-			row = append(row, results[k]["mem"][i])
+			memRow = append(memRow, results[k]["mem"][i])
+			cpuRow = append(cpuRow, results[k]["cpu"][i])
 		}
-		f.WriteString(strings.Join(row, ",    "))
-		f.WriteString("\n")
+		cpuFile.WriteString(strings.Join(cpuRow, ",    "))
+		cpuFile.WriteString("\n")
+		memFile.WriteString(strings.Join(memRow, ",    "))
+		memFile.WriteString("\n")
+
 	}
-	writeGnuPlotFile(keys, file)
+	writeGnuPlotFile(keys)
 }
 
 type Row struct {
 	Index int
 }
 
-func writeGnuPlotFile(keys []string, filename string) {
+func writeGnuPlotFile(keys []string) {
 	var gnuTemplate = fmt.Sprintf(`set term png
-set output "graph.png"
-plot {{range .}}'%s' using 1:{{.Index}} with lines, {{end}}`, filename)
+set output "graph_mem.png"
+plot {{range .}}'%s' using 1:{{.Index}} with lines, {{end}}
+set term png
+set output "graph_cpu.png"
+plot {{range .}}'%s' using 1:{{.Index}} with lines, {{end}}`, memFileName, cpuFileName)
 
 	t := template.New("t")
 	parsed, err := t.Parse(gnuTemplate)
@@ -133,7 +150,7 @@ plot {{range .}}'%s' using 1:{{.Index}} with lines, {{end}}`, filename)
 		fmt.Println("something went wrong with templating")
 	}
 
-	f, err := os.Create("template.gp")
+	f, err := os.Create(fmt.Sprintf("template_%s.gp", now.Format(layout)))
 	if err != nil {
 		fmt.Println("could not open file for writing the template")
 	}
